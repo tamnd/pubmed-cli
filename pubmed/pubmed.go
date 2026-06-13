@@ -1,52 +1,287 @@
-// Package pubmed is the library behind the pubmed command line:
-// the HTTP client, request shaping, and the typed data models for pubmed.
+// Package pubmed is the library behind the pubmed command: the HTTP client,
+// request shaping, and the typed data models for PubMed.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// All data comes from the NCBI E-utilities REST API at
+// https://eutils.ncbi.nlm.nih.gov/entrez/eutils. No API key is required.
+// The default rate of 400ms between requests stays under the 3 req/s limit
+// for anonymous access.
 package pubmed
 
 import (
 	"context"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to pubmed. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to NCBI.
 const DefaultUserAgent = "pubmed/dev (+https://github.com/tamnd/pubmed-cli)"
 
-// Client talks to pubmed over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+// ErrNotFound is returned when a PMID or result set yields no data.
+var ErrNotFound = errors.New("not found")
 
-	last time.Time
+// Config holds constructor parameters.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for anonymous NCBI access.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
+		Rate:      400 * time.Millisecond,
 		Retries:   5,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the NCBI E-utilities API.
+type Client struct {
+	httpClient *http.Client
+	baseURL    string
+	userAgent  string
+	rate       time.Duration
+	retries    int
+	mu         sync.Mutex
+	last       time.Time
+}
+
+// NewClient returns a Client with the given config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+		baseURL:    cfg.BaseURL,
+		userAgent:  cfg.UserAgent,
+		rate:       cfg.Rate,
+		retries:    cfg.Retries,
+	}
+}
+
+// Search searches PubMed for articles matching query and returns up to limit Article records.
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Article, error) {
+	pmids, err := c.search(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(pmids) == 0 {
+		return nil, ErrNotFound
+	}
+	return c.summary(ctx, pmids, 1)
+}
+
+// Article returns the Article record for a single PMID.
+func (c *Client) Article(ctx context.Context, pmid string) (Article, error) {
+	arts, err := c.summary(ctx, []string{pmid}, 1)
+	if err != nil {
+		return Article{}, err
+	}
+	if len(arts) == 0 {
+		return Article{}, ErrNotFound
+	}
+	return arts[0], nil
+}
+
+// Abstract fetches and returns the full abstract for a PMID.
+func (c *Client) Abstract(ctx context.Context, pmid string) (Abstract, error) {
+	// Get metadata first.
+	art, err := c.Article(ctx, pmid)
+	if err != nil {
+		return Abstract{}, err
+	}
+
+	// Fetch abstract XML.
+	u := c.buildURL("/efetch.fcgi", url.Values{
+		"db":      {"pubmed"},
+		"id":      {pmid},
+		"retmode": {"xml"},
+		"rettype": {"abstract"},
+	})
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return Abstract{}, err
+	}
+
+	var set pubmedArticleSet
+	if err := xml.Unmarshal(body, &set); err != nil {
+		return Abstract{}, fmt.Errorf("decode abstract xml: %w", err)
+	}
+	if len(set.Articles) == 0 {
+		return Abstract{}, ErrNotFound
+	}
+
+	texts := set.Articles[0].MedlineCitation.Article.AbstractTexts
+	absText := joinAbstract(texts)
+
+	return Abstract{
+		PMID:     art.PMID,
+		Title:    art.Title,
+		Authors:  art.Authors,
+		Journal:  art.Journal,
+		Date:     art.Date,
+		Abstract: absText,
+		URL:      art.URL,
+	}, nil
+}
+
+// Related returns articles related to the given PMID via NCBI link scoring.
+func (c *Client) Related(ctx context.Context, pmid string, limit int) ([]Article, error) {
+	u := c.buildURL("/elink.fcgi", url.Values{
+		"dbfrom":  {"pubmed"},
+		"db":      {"pubmed"},
+		"cmd":     {"neighbor_score"},
+		"id":      {pmid},
+		"retmode": {"json"},
+	})
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp elinkResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode elink: %w", err)
+	}
+
+	var pmids []string
+	for _, ls := range resp.LinkSets {
+		for _, db := range ls.LinkSetDBs {
+			if db.LinkName == "pubmed_pubmed" {
+				for _, lk := range db.Links {
+					pmids = append(pmids, lk.ID)
+					if limit > 0 && len(pmids) >= limit {
+						break
+					}
+				}
+			}
+		}
+	}
+	if len(pmids) == 0 {
+		return nil, ErrNotFound
+	}
+	return c.summary(ctx, pmids, 1)
+}
+
+// ─── internal helpers ─────────────────────────────────────────────────────────
+
+func (c *Client) search(ctx context.Context, query string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := c.buildURL("/esearch.fcgi", url.Values{
+		"db":         {"pubmed"},
+		"term":       {query},
+		"retmax":     {fmt.Sprintf("%d", limit)},
+		"retmode":    {"json"},
+		"usehistory": {"y"},
+	})
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp esearchResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode esearch: %w", err)
+	}
+	return resp.ESearchResult.IDList, nil
+}
+
+func (c *Client) summary(ctx context.Context, pmids []string, startRank int) ([]Article, error) {
+	if len(pmids) == 0 {
+		return nil, nil
+	}
+	// Batch up to 200 at a time.
+	const batchSize = 200
+	var out []Article
+	rank := startRank
+	for i := 0; i < len(pmids); i += batchSize {
+		end := i + batchSize
+		if end > len(pmids) {
+			end = len(pmids)
+		}
+		batch := pmids[i:end]
+		arts, err := c.summaryBatch(ctx, batch, rank)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, arts...)
+		rank += len(arts)
+	}
+	return out, nil
+}
+
+func (c *Client) summaryBatch(ctx context.Context, pmids []string, startRank int) ([]Article, error) {
+	u := c.buildURL("/esummary.fcgi", url.Values{
+		"db":      {"pubmed"},
+		"id":      {strings.Join(pmids, ",")},
+		"retmode": {"json"},
+	})
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+
+	// The result map has a "uids" key (array) plus one key per PMID.
+	// We unmarshal result into map[string]json.RawMessage to handle the
+	// heterogeneous "uids" key, then decode only the PMID entries.
+	var raw struct {
+		Result map[string]json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decode esummary: %w", err)
+	}
+
+	// Read uid ordering from the "uids" key.
+	var uids []string
+	if v, ok := raw.Result["uids"]; ok {
+		if err := json.Unmarshal(v, &uids); err != nil {
+			return nil, fmt.Errorf("decode esummary uids: %w", err)
+		}
+	} else {
+		// Fallback: use the pmids we requested (order may differ).
+		uids = pmids
+	}
+
+	out := make([]Article, 0, len(uids))
+	rank := startRank
+	for _, uid := range uids {
+		v, ok := raw.Result[uid]
+		if !ok {
+			continue
+		}
+		var doc summaryDoc
+		if err := json.Unmarshal(v, &doc); err != nil {
+			continue
+		}
+		if doc.UID == "" {
+			continue
+		}
+		out = append(out, docToArticle(doc, rank))
+		rank++
+	}
+	return out, nil
+}
+
+func (c *Client) buildURL(path string, params url.Values) string {
+	// Append NCBI courtesy parameters.
+	params.Set("tool", "pubmed-cli")
+	params.Set("email", "tamnd87@gmail.com")
+	return c.baseURL + path + "?" + params.Encode()
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -54,7 +289,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -63,18 +298,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -86,20 +322,20 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -111,4 +347,61 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
+}
+
+// ─── conversion helpers ───────────────────────────────────────────────────────
+
+func docToArticle(doc summaryDoc, rank int) Article {
+	return Article{
+		Rank:    rank,
+		PMID:    doc.UID,
+		Title:   doc.Title,
+		Authors: formatAuthors(doc.Authors),
+		Journal: doc.Source,
+		Date:    doc.PubDate,
+		DOI:     extractDOI(doc.ArticleIDs),
+		URL:     "https://pubmed.ncbi.nlm.nih.gov/" + doc.UID + "/",
+	}
+}
+
+func formatAuthors(authors []authorItem) string {
+	if len(authors) == 0 {
+		return ""
+	}
+	names := make([]string, 0, 3)
+	for i, a := range authors {
+		if i >= 3 {
+			break
+		}
+		names = append(names, a.Name)
+	}
+	s := strings.Join(names, ", ")
+	if len(authors) > 3 {
+		s += " et al."
+	}
+	return s
+}
+
+func extractDOI(ids []articleID) string {
+	for _, a := range ids {
+		if a.IDType == "doi" {
+			return a.Value
+		}
+	}
+	return ""
+}
+
+func joinAbstract(texts []abstractText) string {
+	var parts []string
+	for _, t := range texts {
+		s := strings.TrimSpace(t.Text)
+		if s == "" {
+			continue
+		}
+		if t.Label != "" {
+			s = t.Label + ": " + s
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, "\n")
 }
