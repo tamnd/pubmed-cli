@@ -1,0 +1,10 @@
+title       = "pubmed"
+baseURL     = "https://pubmed-cli.tamnd.com/"
+description = "Search PubMed biomedical literature"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/pubmed-cli"
